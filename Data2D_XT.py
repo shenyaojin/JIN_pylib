@@ -57,6 +57,8 @@ class Data2D():
             out_t = t0
         if type(t) is datetime:
             out_t = (t-self.start_time).total_seconds()
+        if isinstance(t,str):
+            out_t = (parse(t)-self.start_time).total_seconds()
         return out_t
     
     def reset_starttime(self):
@@ -254,14 +256,18 @@ class Data2D():
             ,xtickN = 4
             ,timefmt = '%m/%d\n%H:%M:%S.{ms}' 
             ,timefmt_ms_precision = 1
+            ,scale = None
+            ,islog = False
             ):
         '''
         timescale options: 'second','hour','day'
         '''
         extent = self.get_extent(ischan=ischan
             ,timescale=timescale,use_timestamp=use_timestamp)
-        plt.imshow(self.data[::downsample[0],::downsample[1]]
-                ,cmap = cmap, aspect='auto',extent=extent)
+        plotdata = self.data[::downsample[0],::downsample[1]]
+        if islog:
+            plotdata = 10*np.log10(plotdata)
+        plt.imshow(plotdata ,cmap = cmap, aspect='auto',extent=extent)
         if use_timestamp:
             plt.gca().xaxis_date()
             date_format = PrecisionDateFormatter(timefmt
@@ -269,6 +275,14 @@ class Data2D():
             plt.gca().xaxis.set_major_locator(plt.MaxNLocator(xtickN))
             plt.xticks(rotation=xaxis_rotation)
             plt.gca().xaxis.set_major_formatter(date_format)
+        if scale is not None:
+            if isinstance(scale,(int,float)):
+                minval = np.nanpercentile(plotdata,scale/2)
+                maxval = np.nanpercentile(plotdata,100-scale/2)
+                plt.clim(minval,maxval)
+            elif isinstance(scale,(list,tuple,np.ndarray)):
+                plt.clim(scale)
+        
 
     def plot_wiggle(self,scale=1,trace_step = 1,linewidth=1):
         # Extract the data, time axis, and distance axis from the seismic_data object
@@ -335,6 +349,12 @@ class Data2D():
         ind = np.argmin(np.abs(self.mds-depth))
         md = self.mds[ind]
         return md,self.data[ind,:]
+    
+    def get_value_by_time(self,t):
+        ind = np.argmin(np.abs(self.taxis-t))
+        actual_t = self.taxis[ind]
+        return actual_t,self.data[:,ind]
+
 
     def get_value_by_timestr(self,timestr,fmt=None):
         if fmt is None:
@@ -345,6 +365,26 @@ class Data2D():
         ind = np.argmin(np.abs(self.taxis-dt))
         output_time = self.start_time + timedelta(seconds=self.taxis[ind])
         return output_time,self.data[:,ind]
+    
+    def get_time_average_value(self,center_time,**kargs):
+        '''
+        Usage: 
+            center_time = '2023-01-01 05:02:12' # can also be datetime
+            get_time_average_value(center_time,seconds=5)
+        '''
+        center_time = self._check_inputtime(center_time,None)
+        time_range = timedelta(**kargs).total_seconds()
+        bgtime = center_time-time_range/2
+        edtime = center_time+time_range/2
+        ind = (self.taxis>=bgtime)&(self.taxis<=edtime)
+        return np.nanmean(self.data[:,ind],axis=1)
+
+    def get_depth_average_value(self,center_depth,depth_range):
+        bgdist = center_depth-depth_range/2
+        eddist = center_depth+depth_range/2
+        ind = (self.daxis>=bgdist)&(self.daxis<=eddist)
+        return np.nanmean(self.data[ind,:],axis=0)
+
     
     def make_audio_file(self,filename,bgdp=None,eddp=None):
         from scipy.io.wavfile import write
