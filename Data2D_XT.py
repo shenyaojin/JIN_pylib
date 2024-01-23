@@ -35,6 +35,16 @@ class Data2D():
     def mds(self, mds):
         self.daxis = mds
     
+    def get_datetime64(self):
+        timestamps = []
+        for t in self.taxis:
+            timestamps.append(np.datetime64(self.start_time + timedelta(seconds=t)))
+        return np.array(timestamps)
+    
+    def get_mdates_taxis(self):
+        timestamps = [self.start_time + timedelta(seconds=t) for t in self.taxis]
+        return mdates.date2num(timestamps)
+    
     def set_time_from_datetime(self, timestamps):
         """
         Sets the start time and time axis for the data from a list of datetime objects.
@@ -61,6 +71,14 @@ class Data2D():
         """
         self.start_time += timedelta(hours=ts)
     
+    def print_info(self):
+        print(f'Start time: {self.start_time}')
+        print(f'taxis: {self.taxis[0]} - {self.taxis[-1]} seconds')
+        print(f'daxis: {self.daxis[0]} - {self.daxis[-1]}')
+        print(f'data dimension: {self.data.shape}')
+        print(f'taxis dimension: {self.taxis.shape}')
+        print(f'daxis dimension: {self.daxis.shape}')
+    
     def cal_timestamp_from_taxis(self):
         """
         Calculates the timestamps from the time axis.
@@ -79,7 +97,7 @@ class Data2D():
         out_t = t
         if t is None:
             out_t = t0
-        if type(t) is datetime:
+        if isinstance(t, (datetime, pd.Timestamp)):
             out_t = (t-self.start_time).total_seconds()
         if isinstance(t,str):
             out_t = (parse(t)-self.start_time).total_seconds()
@@ -137,8 +155,8 @@ class Data2D():
             dists = self.chans
         else:
             dists = self.daxis
-        bgt = self._check_inputtime(bgdp,dists[0])
-        edt = self._check_inputtime(eddp,dists[-1])
+        bgdp = self._check_inputtime(bgdp,dists[0])
+        eddp = self._check_inputtime(eddp,dists[-1])
         
         ind = (dists>=bgdp)&(dists<=eddp)
         if makecopy:
@@ -201,11 +219,13 @@ class Data2D():
             print('cannot find chans field')
             pass
     
-    def lp_filter(self,corner_freq,order=2,axis=1):
+    def lp_filter(self,corner_freq,order=2,axis=1,edge_taper=0.1):
         if axis == 1:
             dt = np.median(np.diff(self.taxis))
+            self.data *= tukey(self.data.shape[1],edge_taper).reshape((1,-1))
         if axis == 0:
             dt = np.median(np.diff(self.mds))
+            self.data *= tukey(self.data.shape[0],edge_taper).reshape((-1,1))
         self.data = gjsignal.lpfilter(self.data,dt,corner_freq,order=order,axis=axis)
         self.history.append('lp_filter(corner_freq={},order={},axis={})'
                 .format(corner_freq,order,axis))
@@ -213,22 +233,37 @@ class Data2D():
     def hp_filter(self,corner_freq,order=2,axis=1,edge_taper=0.1):
         if axis == 1:
             dt = np.median(np.diff(self.taxis))
+            self.data *= tukey(self.data.shape[1],edge_taper).reshape((1,-1))
         if axis == 0:
             dt = np.median(np.diff(self.mds))
-        self.data *= tukey(self.data.shape[1],edge_taper).reshape((1,-1))
+            self.data *= tukey(self.data.shape[0],edge_taper).reshape((-1,1))
         self.data = gjsignal.hpfilter(self.data,dt,corner_freq,order=order,axis=axis)
         self.history.append('hp_filter(corner_freq={},order={},axis={})'
                 .format(corner_freq,order,axis))
+    def bp_filter(self, lowf, highf, order=2, axis=1, edge_taper=0.1):
+        """
+        Apply a bandpass filter to the data.
 
-    def bp_filter(self,lowf,highf,order=2,axis=1,edge_taper=0.1):
+        Parameters:
+        lowf (float): The lower frequency limit of the bandpass filter.
+        highf (float): The upper frequency limit of the bandpass filter.
+        order (int, optional): The order of the filter. Default is 2.
+        axis (int, optional): The axis along which to apply the filter. Default is 1.
+        edge_taper (float, optional): The proportion of the data to taper at the edges. Default is 0.1.
+
+        Returns:
+        None. The data is modified in-place.
+        """
         if axis == 1:
             dt = np.median(np.diff(self.taxis))
+            self.data *= tukey(self.data.shape[1],edge_taper).reshape((1,-1))
         if axis == 0:
             dt = np.median(np.diff(self.mds))
-        self.data *= tukey(self.data.shape[1],edge_taper).reshape((1,-1))
-        self.data = gjsignal.bpfilter(self.data,dt,lowf,highf,order=order,axis=axis)
+            self.data *= tukey(self.data.shape[0],edge_taper).reshape((-1,1))
+        self.data *= tukey(self.data.shape[1], edge_taper).reshape((1, -1))
+        self.data = gjsignal.bpfilter(self.data, dt, lowf, highf, order=order, axis=axis)
         self.history.append('bp_filter(lowf={},highf={},order={},axis={})'
-                .format(lowf,highf,order,axis))
+                .format(lowf, highf, order, axis))
     
     def down_sample(self,ds_R):
         dt = np.median(np.diff(self.taxis))
@@ -312,7 +347,7 @@ class Data2D():
             ,timescale=timescale,use_timestamp=use_timestamp)
         plotdata = self.data[::downsample[0],::downsample[1]]
         if islog:
-            plotdata = 10*np.log10(plotdata)
+            plotdata = 10*np.log10(plotdata.copy())
         plt.imshow(plotdata ,cmap = cmap, aspect='auto',extent=extent)
         if use_timestamp:
             plt.gca().xaxis_date()
@@ -396,11 +431,16 @@ class Data2D():
         md = self.mds[ind]
         return md,self.data[ind,:]
     
+    def get_spectrum_by_depth(self,depth):
+        md,trace = self.get_value_by_depth(depth)
+        dt = np.median(np.diff(self.taxis))
+        f,spe = gjsignal.amp_spectrum(trace,dt)
+        return f, spe
+    
     def get_value_by_time(self,t):
         ind = np.argmin(np.abs(self.taxis-t))
         actual_t = self.taxis[ind]
         return actual_t,self.data[:,ind]
-
 
     def get_value_by_timestr(self,timestr,fmt=None):
         if fmt is None:
