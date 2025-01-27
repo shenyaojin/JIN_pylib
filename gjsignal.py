@@ -200,6 +200,22 @@ def running_average(data, N):
         outdata[-i] = np.mean(data[-i - halfN:])
     return outdata
 
+def down_sample(data, ratio):
+    '''
+    Downsamples the input data by the given ratio after applying a low-pass filter.
+    def down_sample(data, ratio):
+
+    Parameters:
+    data (array-like): The input data to be downsampled.
+    ratio (int): The downsampling ratio. Must be a positive integer.
+
+    Returns:
+    array-like: The downsampled data.
+    '''
+    lpdata = lpfilter(data, 1, 1 / ratio / 2)
+    return lpdata[::ratio]
+
+
 
 def degC_to_degK(C):
     return C - 273.15
@@ -264,9 +280,164 @@ def multi_legend(lns,loc='best'):
 
 
 def datetime_interp(timex,timex0,y0):
+    """
+    def datetime_interp(timex,timex0,y0):
+        Interpolate data to a new time axis.
+        Parameters:
+        
+        timex (list): List of datetime objects for the new time axis.
+        timex0 (list): List of datetime objects for the original time axis.
+        y0 (list): List of data values corresponding to the original time axis.
+        
+        Returns:
+        list: List of data values interpolated to the new time axis.
+    """
     x = [(t-timex0[0]).total_seconds() for t in timex]
     x0 = [(t-timex0[0]).total_seconds() for t in timex0]
     return np.interp(x,x0,y0)
     
 def running_average(data,N):
     return np.convolve(data,np.ones((N,))/N,mode='same')
+
+
+def find_lpf_edge_effect(corf, dt, threshold=1e-6, isfigure=False):
+    """
+    def find_lpf_edge_effect(corf, dt, threshold=1e-6):
+    Calculate the edge effect of a low-pass filter.
+    This function generates a test signal, applies a low-pass filter to it, 
+    and determines the time difference between the center of the test signal 
+    and the first point where the filtered signal exceeds a given threshold.
+    Parameters:
+    corf (float): The cutoff frequency of the low-pass filter.
+    dt (float): The time step of the signal.
+    threshold (float, optional): The threshold value to determine the edge effect. Default is 1e-6.
+    Returns:
+    float: The time difference between the center of the test signal and the first point 
+           where the filtered signal exceeds the threshold.
+    """
+
+    N = int(1/corf/dt*20)
+    test_data = np.zeros(N)
+    test_data[N//2] = 1
+    taxis = np.arange(N)*dt
+    taxis -= taxis[N//2]
+    ori_testdata = test_data.copy()
+
+    test_data = lpfilter(test_data, dt, corf)
+
+    # find the first point with value larger than threshold
+    idx = np.where(np.abs(test_data)>threshold*np.max(test_data))[0][0]
+
+    if isfigure:
+        plt.plot(taxis,ori_testdata)
+        plt.plot(taxis,test_data)
+        plt.ylim(np.min(test_data)*5,np.max(test_data)*2)
+        plt.axvline(taxis[idx],color='r', linestyle='--')
+
+    return taxis[N//2]-taxis[idx]
+
+
+def sta_lta_1d(timeseries, dt, STA, LTA):
+    """
+    Implement STA/LTA method for earthquake detection using RMS and convolution.
+    def sta_lta_1d(timeseries, dt, STA, LTA):
+
+    Parameters:
+    timeseries (numpy array): 1D array of time series data
+    dt (float): Time sample interval in seconds
+    STA (float): Length of Short-Term Average window in seconds
+    LTA (float): Length of Long-Term Average window in seconds
+
+    Returns:
+    numpy array: 1D array of STA/LTA ratio
+    """
+    # Convert LTA and STA from seconds to number of samples
+    LTA_samples = int(LTA / dt)
+    STA_samples = int(STA / dt)
+
+    # Calculate the squared values of the timeseries for RMS calculation
+    squared_timeseries = timeseries ** 2
+
+    # Define windows for STA and LTA
+    STA_window = np.ones(STA_samples) / STA_samples
+    LTA_window = np.ones(LTA_samples) / LTA_samples
+
+    # Compute RMS for STA and LTA using convolution
+    sta_rms = np.sqrt(np.convolve(squared_timeseries, STA_window, mode='same'))
+    lta_rms = np.sqrt(np.convolve(squared_timeseries, LTA_window, mode='same'))
+
+    # Shift STA ahead of LTA by LTA_samples to ensure STA window is ahead
+    lta_rms_shifted = np.roll(lta_rms, int((LTA_samples + STA_samples) / 2))
+
+    # Avoid division by zero and calculate STA/LTA ratio
+
+    sta_lta_ratio = sta_rms/lta_rms_shifted
+    sta_lta_ratio[:LTA_samples+STA_samples//2] = 0  # Set initial values to zero to avoid edge effects
+    sta_lta_ratio[-STA_samples//2:] = 0  # Set final values to zero to avoid edge effects
+    
+    return sta_lta_ratio
+
+def sta_lta_2d(timeseries, dt, STA, LTA):
+    """
+    Implement STA/LTA method for earthquake detection using RMS and convolution.
+    def sta_lta_2d(timeseries, dt, STA, LTA):
+
+    Parameters:
+    timeseries (numpy array): 2D array of time series data (channels x samples)
+    dt (float): Time sample interval in seconds
+    STA (float): Length of Short-Term Average window in seconds
+    LTA (float): Length of Long-Term Average window in seconds
+
+    Returns:
+    numpy array: 1D array of averaged STA/LTA ratio across all channels
+    """
+    # Initialize an array to store the STA/LTA ratios for each channel
+    sta_lta_ratios = np.zeros(timeseries.shape)
+
+    for i in range(timeseries.shape[0]):
+        sta_lta_ratios[i] = sta_lta_1d(timeseries[i], dt, STA, LTA)
+
+    # Average the STA/LTA ratios across all channels
+    averaged_sta_lta_ratio = np.mean(sta_lta_ratios, axis=0)
+
+    return averaged_sta_lta_ratio
+
+
+def interp_to_matrix(x0,x,kind='cubic'):
+    ''' Function convert interpolation from grid location x0 to data location x to an interpolation matrix
+    so that interp1d(x0,y0)(x) is equivalent to A.dot(y0)
+    FYI: this is a very slow algorithm for the coding easiness.
+    usage: A = interp_to_matrix(x0,x)
+    input:
+        x0: interpolation control point location, (n,) array
+        x: data point location, (m,) array
+    output:
+        matrix A with shape (m,n)
+    written by Ge Jin, gjin@mines.edu, 09/2019
+    '''
+    A = np.zeros((len(x),len(x0)))
+    for i in range(len(x0)):
+        y0 = np.zeros(len(x0))
+        y0[i] = 1
+        f = interp1d(x0,y0,kind=kind,bounds_error=False,fill_value='extrapolation')
+        A[:,i] = f(x)
+
+    return A
+
+def control_point_curvefit(xc, x0, y0, kind = 'cubic'):
+    ''' Function to fit a curve to the control points
+    usage: y = control_point_curvefit(xc, x0, y0, smooth=1e-4, kind = 'cubic')
+    input:
+        xc: location of control points
+        x0: location of data points
+        y0: data points
+        smooth: smoothing factor for the curve fitting
+        kind: kind of interpolation
+    output:
+        y: fitted curve
+    written by Ge Jin,
+    '''
+    A = interp_to_matrix(xc,x0,kind=kind)
+    yc = np.linalg.lstsq(A,y0)[0]
+    f = interp1d(xc,yc,kind=kind,bounds_error=False,fill_value=(yc[0],yc[-1]))
+    return f

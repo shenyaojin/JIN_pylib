@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from scipy.interpolate import interpn,interp1d
+from datetime import timedelta
 
 from . import gjsignal, Data2D_XT
 
@@ -226,4 +227,35 @@ def spectrum_transform_2D(DASdata):
     spe_data.taxis = f
     spe_data.data = data
     spe_data.daxis = DASdata.daxis
+    spe_data.history = DASdata.history.copy()
+    spe_data.history.append('2D spectrum transform')
     return spe_data
+
+def tranform_STALTA(DASdata, STA, LTA):
+    out = DASdata.copy()
+    dt = np.median(np.diff(DASdata.taxis))
+    data = DASdata.data
+    for i in range(data.shape[0]):
+        out.data[i,:] = gjsignal.sta_lta_1d(data[i,:],dt,STA,LTA)
+    out.history.append(f'STA: {STA}, LTA: {LTA}')
+    return out
+
+def select_stalta_triggers(stadata, threshold, gap=1):
+    ind = np.where(stadata.data[0]> threshold)[0]
+    dt = np.median(np.diff(stadata.taxis))
+    gap = int(gap/dt)
+    if len(ind) == 0:
+        return []
+    filtered_ind = ind[np.insert(np.diff(ind) > gap, 0, True)]
+    timestamps = [stadata.start_time + timedelta(seconds=stadata.taxis[i]) for i in filtered_ind]
+    return timestamps
+
+def transform_histogram(DASdata, bins):
+    histograms = []
+    for i in range(0,DASdata.data.shape[0]):
+        hist, bins = np.histogram(DASdata.data[i,:], bins=bins)
+        histograms.append(hist)
+    output_data = DASdata.copy()
+    output_data.taxis = bins
+    output_data.data = np.array(histograms)
+    return output_data

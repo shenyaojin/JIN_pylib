@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+
+from tqdm import tqdm
 from . import gjsignal
 from .VizUtil import PrecisionDateFormatter
 import numpy as np
@@ -14,8 +16,8 @@ try:
     from scipy.signal.windows import tukey
 except:
     pass
+from scipy.interpolate import interp1d
 import matplotlib.dates as mdates
-from dateutil.parser import parse
 from copy import copy
 import h5py
 import copy
@@ -53,6 +55,18 @@ class Data2D():
         timestamps = [self.start_time + timedelta(seconds=t) for t in self.taxis]
         return mdates.date2num(timestamps)
     
+    def get_datetime(self):
+        timestamps = [self.start_time + timedelta(seconds=t) for t in self.taxis]
+        return timestamps
+    
+    def get_stalta(self,sta,lta):
+        dt = np.median(np.diff(self.taxis))
+        stalta_ratio = gjsignal.sta_lta_2d(self.data,dt,sta,lta)
+        ind = (self.taxis>sta/2+lta)&(self.taxis<self.taxis[-1]-sta/2)
+        timestamps = self.get_datetime64()
+        stalta_ratio = stalta_ratio
+        return timestamps,stalta_ratio
+    
     def set_time_from_datetime(self, timestamps):
         """
         Sets the start time and time axis for the data from a list of datetime objects.
@@ -64,6 +78,9 @@ class Data2D():
         total seconds from the start time for each timestamp.
 
         """
+            # Check if timestamps are in np.datetime64 format and convert them to datetime
+        if isinstance(timestamps[0], np.datetime64):
+            timestamps = [pd.to_datetime(t).to_pydatetime() for t in timestamps]
         self.start_time = timestamps[0]
         self.taxis = np.array([(t-timestamps[0]).total_seconds()
              for t in timestamps])
@@ -82,10 +99,14 @@ class Data2D():
     def print_info(self):
         print(f'Start time: {self.start_time}')
         print(f'taxis: {self.taxis[0]} - {self.taxis[-1]} seconds')
+        dt = np.diff(self.taxis)
+        print(f'time interval: min: {np.min(dt)}, max: {np.max(dt)}, median: {np.median(dt)}')
         print(f'daxis: {self.daxis[0]} - {self.daxis[-1]}')
         print(f'data dimension: {self.data.shape}')
+        print(f'data size: {int(self.data.size*4/1e6)} MB')
         print(f'taxis dimension: {self.taxis.shape}')
         print(f'daxis dimension: {self.daxis.shape}')
+        print(f'history: {self.history}')
     
     def cal_timestamp_from_taxis(self):
         """
@@ -108,7 +129,7 @@ class Data2D():
         if isinstance(t, (datetime, pd.Timestamp)):
             out_t = (t-self.start_time).total_seconds()
         if isinstance(t,str):
-            out_t = (parse(t)-self.start_time).total_seconds()
+            out_t = (pd.to_datetime(t)-self.start_time).total_seconds()
         return out_t
     
     def reset_starttime(self):
@@ -141,9 +162,9 @@ class Data2D():
         bgt = self._check_inputtime(bgtime,self.taxis[0])
         edt = self._check_inputtime(edtime,self.taxis[-1])
         
-        ind = (self.taxis>=bgt)&(self.taxis<=edt)
+        ind = (self.taxis>=bgt)&(self.taxis<edt)
         if makecopy:
-            out_data = copy.copy(self)
+            out_data = self.copy()
             out_data.taxis = self.taxis[ind]
             if reset_starttime:
                 out_data.start_time += timedelta(seconds=out_data.taxis[0])
@@ -156,6 +177,7 @@ class Data2D():
                 self.start_time += timedelta(seconds=self.taxis[0])
                 self.taxis -= self.taxis[0]
             self.data = self.data[:,ind]
+            return self
 
     def select_depth(self,bgdp,eddp,makecopy=False,ischan=False):
         
@@ -168,7 +190,7 @@ class Data2D():
         
         ind = (dists>=bgdp)&(dists<=eddp)
         if makecopy:
-            out_data = copy.copy(self)
+            out_data = self.copy()
             out_data.data = out_data.data[ind,:]
             try:
                 out_data.daxis =out_data.daxis[ind]
@@ -190,6 +212,7 @@ class Data2D():
                 self.chans =self.chans[ind]
             except: 
                 pass
+            return self
     
     def copy(self):
         return copy.deepcopy(self)
@@ -227,28 +250,66 @@ class Data2D():
             print('cannot find chans field')
             pass
     
-    def lp_filter(self,corner_freq,order=2,axis=1,edge_taper=0.1):
+    def lp_filter(self,corner_freq,order=2,axis=1,edge_taper=0.0):
+        """
+        Apply a low-pass filter to the data.
+
+        Parameters:
+        corner_freq (float): The cutoff frequency of the low-pass filter.
+        order (int, optional): The order of the filter. Default is 2.
+        axis (int, optional): The axis along which to apply the filter. Default is 1.
+        edge_taper (float, optional): The seconds of the data to taper at the edges. Default is 0.0.
+
+        Returns:
+        self
+        """
         if axis == 1:
             dt = np.median(np.diff(self.taxis))
-            self.data *= tukey(self.data.shape[1],edge_taper).reshape((1,-1))
         if axis == 0:
             dt = np.median(np.diff(self.mds))
-            self.data *= tukey(self.data.shape[0],edge_taper).reshape((-1,1))
+        self.edge_taper(edge_taper=edge_taper,axis=axis)
         self.data = gjsignal.lpfilter(self.data,dt,corner_freq,order=order,axis=axis)
         self.history.append('lp_filter(corner_freq={},order={},axis={})'
                 .format(corner_freq,order,axis))
+        return self
 
-    def hp_filter(self,corner_freq,order=2,axis=1,edge_taper=0.1):
+    def hp_filter(self,corner_freq,order=2,axis=1,edge_taper=0.0):
+        """
+        Apply a high-pass filter to the data.
+
+        Parameters:
+        corner_freq (float): The cutoff frequency of the high-pass filter.
+        order (int, optional): The order of the filter. Default is 2.
+        axis (int, optional): The axis along which to apply the filter. Default is 1.
+        edge_taper (float, optional): The seconds of the data to taper at the edges. Default is 0.0.
+
+        Returns:
+        Self. The data is modified in-place.
+        """
+        self.edge_taper(edge_taper=edge_taper,axis=axis)
         if axis == 1:
             dt = np.median(np.diff(self.taxis))
-            self.data *= tukey(self.data.shape[1],edge_taper).reshape((1,-1))
         if axis == 0:
             dt = np.median(np.diff(self.mds))
-            self.data *= tukey(self.data.shape[0],edge_taper).reshape((-1,1))
         self.data = gjsignal.hpfilter(self.data,dt,corner_freq,order=order,axis=axis)
         self.history.append('hp_filter(corner_freq={},order={},axis={})'
                 .format(corner_freq,order,axis))
-    def bp_filter(self, lowf, highf, order=2, axis=1, edge_taper=0.1):
+        return self
+    
+    def edge_taper(self,edge_taper=0,axis=1):
+        if axis == 1:
+            dt = np.median(np.diff(self.taxis))
+            edge_N = edge_taper/dt
+            edge_taper_ratio = edge_N/self.data.shape[1]
+            self.data *= tukey(self.data.shape[1],edge_taper_ratio*2).reshape((1,-1))
+        if axis == 0:
+            dt = np.median(np.diff(self.daxis))
+            edge_N = edge_taper/dt
+            edge_taper_ratio = edge_N/self.data.shape[0]
+            self.data *= tukey(self.data.shape[0],edge_taper_ratio*2).reshape((-1,1))
+        self.history.append('edge_taper(axis={})'.format(axis))
+
+    def bp_filter(self, lowf, highf, order=2, axis=1, edge_taper=0.0):
         """
         Apply a bandpass filter to the data.
 
@@ -257,21 +318,20 @@ class Data2D():
         highf (float): The upper frequency limit of the bandpass filter.
         order (int, optional): The order of the filter. Default is 2.
         axis (int, optional): The axis along which to apply the filter. Default is 1.
-        edge_taper (float, optional): The proportion of the data to taper at the edges. Default is 0.1.
+        edge_taper (float, optional): The seconds of the data to taper at the edges. Default is 0.0.
 
         Returns:
-        None. The data is modified in-place.
+        self. The data is modified in-place.
         """
         if axis == 1:
             dt = np.median(np.diff(self.taxis))
-            self.data *= tukey(self.data.shape[1],edge_taper).reshape((1,-1))
         if axis == 0:
             dt = np.median(np.diff(self.mds))
-            self.data *= tukey(self.data.shape[0],edge_taper).reshape((-1,1))
-        self.data *= tukey(self.data.shape[1], edge_taper).reshape((1, -1))
+        self.edge_taper(edge_taper=edge_taper, axis=axis)
         self.data = gjsignal.bpfilter(self.data, dt, lowf, highf, order=order, axis=axis)
         self.history.append('bp_filter(lowf={},highf={},order={},axis={})'
                 .format(lowf, highf, order, axis))
+        return self
     
     def take_gradient(self,axis=1):
         data = np.gradient(self.data,axis=axis)
@@ -282,12 +342,29 @@ class Data2D():
         self.data = data
         self.history.append('take_gradient(axis={})'.format(axis))
     
-    def down_sample(self,ds_R):
+    def down_sample(self,ds_R, **kwargs):
+        """
+        Downsamples the data by a given reduction factor.
+
+        Parameters:
+        ds_R (int, edge_taper = 0): The reduction factor by which to downsample the data.
+
+        edge_taper (float, optional): The seconds of the data to taper at the edges. Default is 0.0.
+
+        This method performs the following steps:
+        1. Calculates the median time difference (dt) from the time axis.
+        2. Applies a low-pass filter to the data with a cutoff frequency based on the downsampling rate.
+        3. Downsamples the data and the time axis by the given reduction factor.
+        4. Appends the downsampling operation to the history.
+
+        Note:
+        - The low-pass filter is applied to prevent aliasing during the downsampling process.
+        """
         dt = np.median(np.diff(self.taxis))
-        self.lp_filter(1/dt/2/ds_R*0.8)
+        self.lp_filter(1/dt/2/ds_R*0.8, **kwargs)
         self.data = self.data[:,::ds_R]
         self.taxis = self.taxis[::ds_R]
-        self.history.append('down_sample({})'.format(ds_R))
+        self.history.append('down_sample({}, {})'.format(ds_R, kwargs))
 
 
     def take_time_diff(self):
@@ -353,7 +430,7 @@ class Data2D():
             ,downsample=[1,1]
             ,xaxis_rotation=0
             ,xtickN = 4
-            ,timefmt = '%m/%d\n%H:%M:%S.{ms}' 
+            ,timefmt = '%y/%m/%d\n%H:%M:%S.{ms}' 
             ,timefmt_ms_precision = 1
             ,scale = None
             ,islog = False
@@ -413,7 +490,29 @@ class Data2D():
     
     def fill_gap_zeros(self,fill_value=0,dt=None, is_average = False):
         """
-        Filling data gap with zeros or with a fixed value
+        def fill_gap_zeros(self, fill_value=0, dt=None, is_average=False):
+            Fills gaps in the data with zeros or a specified fixed value.
+
+            Parameters:
+            -----------
+            fill_value : int or float, optional
+                The value to fill the gaps with. Default is 0.
+            dt : float, optional
+                The time interval to use for filling gaps. If None, the median of the differences
+                in the time axis (self.taxis) is used. Default is None.
+            is_average : bool, optional
+                If True, the gaps are filled with the average of the surrounding data points.
+                If False, the gaps are filled with the specified fill_value. Default is False.
+
+            Returns:
+            --------
+            None
+                The method updates the object's data and time axis in place.
+
+            Notes:
+            ------
+            - The method modifies the object's `data` and `taxis` attributes.
+            - The method appends a description of the operation to the object's `history` attribute.
         """
         if dt is None:
             dt = np.median(np.diff(self.taxis))
@@ -422,13 +521,13 @@ class Data2D():
         new_data = np.zeros((self.data.shape[0],N))
         new_data[:,:] = fill_value
         if is_average:
-            for i in range(N):
+            for i in tqdm(range(N)):
                 ind = np.abs(self.taxis-new_taxis[i])<dt/2
                 if np.sum(ind)==0:
                     continue
                 new_data[:,i] = np.mean(self.data[:,ind],axis=1)
         else:
-            for i in range(self.data.shape[1]):
+            for i in tqdm(range(self.data.shape[1])):
                 ind = int(np.round(self.taxis[i]/dt))
                 new_data[:,ind] = self.data[:,i]
         self.data = new_data
@@ -436,16 +535,59 @@ class Data2D():
         self.history.append(f'fill_gap_zeros(fill_value={fill_value},dt={dt})')
 
     def fill_gap_interp(self,dt=None):
+        """
+        def fill_gap_interp(self, dt=None):
+            Interpolates to fill gaps in the time axis and updates the data accordingly.
+
+            Parameters:
+            dt (float, optional): The desired time interval for interpolation. If not provided, 
+                                  the median of the differences in the existing time axis is used.
+
+            Updates:
+            self.data (numpy.ndarray): The data array with gaps filled by interpolation.
+            self.taxis (numpy.ndarray): The time axis with gaps filled by interpolation.
+            self.history (list): Appends a string indicating that fill_gap_interp was called with the specified dt.
+        """
         if dt is None:
             dt = np.median(np.diff(self.taxis))
         N = int(np.round((np.max(self.taxis)-np.min(self.taxis))/dt))+1
         new_taxis = np.linspace(np.min(self.taxis),np.max(self.taxis),N)
         new_data = np.zeros((self.data.shape[0],N))
-        for i in range(self.data.shape[0]):
+        print('Filling data gap by interpolation...')
+        for i in tqdm(range(self.data.shape[0])):
             new_data[i,:] = np.interp(new_taxis,self.taxis,self.data[i,:],left=0,right=0)
         self.data = new_data
         self.taxis = new_taxis
         self.history.append(f'fill_gap_interp(dt={dt})')
+    
+    def remove_duplicate_time(self, tol=1e-2, re_interpolate = False):
+        """
+        def remove_duplicate_time(self, re_interpolate=True):
+            Remove duplicate time points from the time axis and corresponding data.
+
+            This method identifies and removes duplicate entries in the time axis (`taxis`).
+            The corresponding data points in `data` are also removed to maintain alignment.
+            Optionally, it can re-interpolate the data to remove abnormal close time points.
+
+            Args:
+                re_interpolate (bool): If True, re-interpolates the data to fill gaps created by the removal of duplicates. Default is True.
+                !! need to make sure that the overlap section is less than 50% 
+
+            Returns:
+                None
+        """
+        # sort the time axis
+        ind = np.argsort(self.taxis)
+        self.taxis = self.taxis[ind]
+        self.data = self.data[:,ind]
+
+        dt = np.median(np.diff(self.taxis))
+        idx = np.where(np.diff(self.taxis)>dt*tol)[0]
+        self.taxis = self.taxis[idx]
+        self.data = self.data[:, idx]
+        if re_interpolate:
+            self.fill_gap_zeros()
+        self.history.append('remove_duplicate_time()')
 
     def interp_time(self,new_taxis):
         new_data = np.zeros((self.data.shape[0],len(new_taxis)))
@@ -455,6 +597,17 @@ class Data2D():
         self.taxis = new_taxis
     
     def get_value_by_depth(self,depth):
+        """
+        def get_value_by_depth(self, depth):
+            Get the data value at the specified depth.
+
+            Parameters:
+            depth (float): The depth value to query.
+
+            Returns:
+            md (float): The closest depth value found in the data.
+            data (numpy.ndarray): The data values at the specified depth.
+        """
         ind = np.argmin(np.abs(self.mds-depth))
         md = self.mds[ind]
         return md,self.data[ind,:]
@@ -472,7 +625,7 @@ class Data2D():
 
     def get_value_by_timestr(self,timestr,fmt=None):
         if fmt is None:
-            t = parse(timestr)
+            t = pd.to_datetime(timestr)
         else:
             t = datetime.strptime(timestr,fmt)
         dt = (t-self.start_time).total_seconds()
@@ -557,7 +710,7 @@ class Data2D():
         self.taxis = np.arange(data.shape[1])*dt
         self.daxis = np.arange(data.shape[0])*dx
 
-def merge_data2D(data_list):
+def merge_data2D(data_list, daxis = None):
     data_list = np.array(data_list)
     bgtime_lst = np.array([d.start_time for d in data_list])
     ind = np.argsort(bgtime_lst)
@@ -571,7 +724,26 @@ def merge_data2D(data_list):
     taxis_list = [d.taxis + (d.start_time-bgtime).total_seconds() for d in data_list]
 
     merge_data = copy.deepcopy(data_list[0])
-    merge_data.data = np.concatenate([d.data.T for d in data_list]).T
+    if daxis is None:
+        merge_data.data = np.concatenate([d.data for d in data_list], axis=1)
+    elif isinstance(daxis, (np.ndarray, list)):
+        tmp = []
+        for d in data_list:
+            f = interp1d(d.daxis,d.data,axis=0, fill_value=np.nan, bounds_error=False)
+            tmp.append(f(daxis))
+        merge_data.data = np.concatenate(tmp,axis=1)
+        merge_data.daxis = daxis
+    elif isinstance(daxis, int):
+        daxis = data_list[daxis].daxis
+        tmp = []
+        for d in data_list:
+            f = interp1d(d.daxis,d.data,axis=0, fill_value=np.nan, bounds_error=False)
+            tmp.append(f(daxis))
+        merge_data.data = np.concatenate(tmp,axis=1)
+        merge_data.daxis = daxis
+    else:
+        raise ValueError('daxis should be either ndarray or list or int or None')
+
     merge_data.taxis = np.concatenate(taxis_list)
     return merge_data
 
